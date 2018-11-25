@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <sstream>
 
 #include "llvm/ADT/Statistic.h"
 #include "llvm/IR/IRBuilder.h"
@@ -37,7 +38,11 @@
 #include "llvm/IR/Module.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
-#include "llvm/IR/DebugInfo.h"
+#if (LLVM_MINOR < 7)
+#include <llvm/DebugInfo.h>
+#else
+#include <llvm/IR/DebugInfo.h>
+#endif
 
 using namespace llvm;
 
@@ -60,14 +65,32 @@ namespace {
 
 }
 
-static inline std::string loc_description (const DebugLoc& dd) {
-  if(!dd) { return "?"; }
-  auto* scope = cast<DIScope>(dd.getScope());
-  return scope->getFilename().str() + ":" + std::to_string(dd.getLine()) + ":" + std::to_string(dd.getCol());
+static std::string getDSPIPath(const DILocation &Loc) {
+  std::string dir = Loc.getDirectory();
+  std::string file = Loc.getFilename();
+  if (dir.empty() || file[0] == '/') {
+    return file;
+  } else if (*dir.rbegin() == '/') {
+    return dir + file;
+  } else {
+    return dir + "/" + file;
+  }
+}
+
+static inline std::string loc_description (const Instruction* I){
+  //if(!dd) { return "?"; }
+  MDNode* N = I->getMetadata("dbg");
+  if(!N) { return "?";}
+
+  std::stringstream ss;
+  DILocation Loc(N);
+  ss << getDSPIPath(Loc) + ":" << Loc.getLineNumber() << ":" << Loc.getColumnNumber() ;
+  return ss.str();
+  //return scope->getFilename().str() + ":" + std::to_string(dd.getLine()) + ":" + std::to_string(dd.getCol());
 }
 
 static inline std::string bb_description(const BasicBlock& bb) {
-  return "(" + loc_description(bb.getInstList().begin()->getDebugLoc()) + "-" + loc_description(bb.getTerminator()->getDebugLoc()) + ")";
+  return "(" + loc_description(&(*bb.begin())) + "-" + loc_description((Instruction*)(bb.getTerminator())) + ")";
 
 }
 
@@ -127,9 +150,14 @@ bool AFLCoverage::runOnModule(Module &M) {
       0, GlobalVariable::GeneralDynamicTLSModel, 0, false);
 
   ConstantInt* PerfMask = ConstantInt::get(Int32Ty, PERF_SIZE-1);
+ 
+  std::vector<Type*> param_vec;
+  param_vec.push_back(CharPtrTy);
+  param_vec.push_back(CharPtrTy);
 
+  ArrayRef<Type*> Params(param_vec);
   Function* LogLocationsFunc = Function::Create(FunctionType::get(VoidTy, 
-      ArrayRef<Type*>({CharPtrTy, CharPtrTy}), true), GlobalVariable::ExternalLinkage,
+      Params, true), GlobalVariable::ExternalLinkage,
       "__afl_log_loc", &M);
   
 
@@ -152,7 +180,7 @@ bool AFLCoverage::runOnModule(Module &M) {
       ConstantInt *CurLoc = ConstantInt::get(Int32Ty, cur_loc);
       
       /* Get current source location information */
-      std::string cur_loc_desc = bb_description(BB);
+      std::string cur_loc_desc  = bb_description(BB);
       Value* CurLocDesc = IRB.CreateGlobalStringPtr(cur_loc_desc);
 
       /* Load prev_loc */
@@ -206,7 +234,13 @@ bool AFLCoverage::runOnModule(Module &M) {
 
       /* Possibly log location */
       LoadInst* PrevLocDesc = IRB.CreateLoad(AFLPrevLocDesc);
-      IRB.CreateCall(LogLocationsFunc, ArrayRef<Value*>({ PrevLocDesc, CurLocDesc }));
+      
+      std::vector<Value*> value_vec;
+      value_vec.push_back(PrevLocDesc);
+      value_vec.push_back(CurLocDesc);
+      ArrayRef<Value*> ValueVec(value_vec);
+
+      IRB.CreateCall(LogLocationsFunc, ValueVec);
       
 
       /* Set prev_loc_desc to cur_loc_desc */
